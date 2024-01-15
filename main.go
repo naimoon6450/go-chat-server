@@ -56,8 +56,6 @@ type Client struct {
 	Strikes           int
 }
 
-type BannedClient struct{}
-
 func server(msgs chan Message) {
 	clients := map[string]*Client{} // making a map of pointers so you can determine if it exists easily via null ptr
 	bannedList := map[string]time.Time{}
@@ -84,6 +82,7 @@ func server(msgs chan Message) {
 					LastMessageSentAt: time.Now(), // you can't connect and send a msg instantly
 				}
 			} else {
+				msg.Conn.Write([]byte("You are banned!"))
 				msg.Conn.Close()
 			}
 		case ClientDisconnected:
@@ -92,32 +91,37 @@ func server(msgs chan Message) {
 			delete(clients, tcpAddr.String())
 		case NewMessage:
 			now := time.Now()
-			clientSendingMsg := clients[tcpAddr.String()]
-			if now.Sub(clientSendingMsg.LastMessageSentAt).Seconds() >= MsgRate {
-				// UPDATE the current clients latest msg sent at time
-				clientSendingMsg.LastMessageSentAt = now
-				log.Printf("Client %s send message %s", safeRemoteAddr(UnsafeMode, msg.Conn), msg.Text)
-				// loop through the rest of the clients to send the msg to them
-				for _, client := range clients {
-					// do not resend to the author of message
-					if client.Conn.RemoteAddr().String() == tcpAddr.String() {
-						continue
-					}
+			clientSendingMsg, exists := clients[tcpAddr.String()]
+			// handle case when user gets banned but still had a msg to send
+			if exists {
+				if now.Sub(clientSendingMsg.LastMessageSentAt).Seconds() >= MsgRate {
+					// UPDATE the current clients latest msg sent at time
+					clientSendingMsg.LastMessageSentAt = now
+					log.Printf("Client %s send message %s", safeRemoteAddr(UnsafeMode, msg.Conn), msg.Text)
+					// loop through the rest of the clients to send the msg to them
+					for _, client := range clients {
+						// do not resend to the author of message
+						if client.Conn.RemoteAddr().String() == tcpAddr.String() {
+							continue
+						}
 
-					// write to the output of everyone
-					_, err := client.Conn.Write([]byte(msg.Text))
-					if err != nil {
-						// REMOVE CONN FROM LIST
-						// MARK AS DEAD AND CLEAN UP ASYNC?
-						log.Println("Could not send data to %s: %s", safeRemoteAddr(UnsafeMode, msg.Conn), err)
+						// write to the output of everyone
+						_, err := client.Conn.Write([]byte(msg.Text))
+						if err != nil {
+							// REMOVE CONN FROM LIST
+							// MARK AS DEAD AND CLEAN UP ASYNC?
+							log.Println("Could not send data to %s: %s", safeRemoteAddr(UnsafeMode, msg.Conn), err)
+						}
+					}
+				} else {
+					clientSendingMsg.Strikes += 1
+					if clientSendingMsg.Strikes >= StrikeLimit {
+						bannedList[tcpAddr.IP.String()] = now
+						clientSendingMsg.Conn.Close()
 					}
 				}
 			} else {
-				clientSendingMsg.Strikes += 1
-				if clientSendingMsg.Strikes >= StrikeLimit {
-					bannedList[tcpAddr.IP.String()] = now
-					clientSendingMsg.Conn.Close()
-				}
+				msg.Conn.Close()
 			}
 		}
 	}
