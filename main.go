@@ -7,10 +7,13 @@ import (
 )
 
 const (
-	Port       = "9090"
-	SafeMode   = true
-	UnsafeMode = false
-	BufferSize = 512
+	Port        = "9090"
+	SafeMode    = true
+	UnsafeMode  = false
+	BufferSize  = 512
+	BanLimit    = 10 * 60.0
+	MsgRate     = 1.0
+	StrikeLimit = 10
 )
 
 // Architecture
@@ -41,10 +44,6 @@ const (
 	NewMessage
 )
 
-const (
-	MsgRate = 1.0
-)
-
 type Message struct {
 	Type MessageType
 	Conn net.Conn
@@ -57,27 +56,43 @@ type Client struct {
 	Strikes           int
 }
 
+type BannedClient struct{}
+
 func server(msgs chan Message) {
 	clients := map[string]*Client{} // making a map of pointers so you can determine if it exists easily via null ptr
+	bannedList := map[string]time.Time{}
 	// we want to traverse the slice of c
 	// and read the outgoing messages from each one
 	for {
 		msg := <-msgs
+		tcpAddr := msg.Conn.RemoteAddr().(*net.TCPAddr)
 		switch msg.Type {
 		case ClientConnected:
-			log.Printf("Client %s has connected", safeRemoteAddr(UnsafeMode, msg.Conn))
-			clients[msg.Conn.RemoteAddr().String()] = &Client{
-				Conn:              msg.Conn,
-				LastMessageSentAt: time.Now(), // you can't connect and send a msg instantly
+			// check if client is banned before connecting
+			bannedAt, banned := bannedList[tcpAddr.IP.String()]
+			if banned {
+				if time.Since(bannedAt) >= BanLimit {
+					delete(bannedList, tcpAddr.IP.String())
+					banned = false
+				}
+			}
+
+			if !banned {
+				log.Printf("Client %s has connected", safeRemoteAddr(UnsafeMode, msg.Conn))
+				clients[tcpAddr.String()] = &Client{
+					Conn:              msg.Conn,
+					LastMessageSentAt: time.Now(), // you can't connect and send a msg instantly
+				}
+			} else {
+				msg.Conn.Close()
 			}
 		case ClientDisconnected:
-			log.Printf("Deleting Client %s form connection list", safeRemoteAddr(UnsafeMode, msg.Conn))
+			log.Printf("Deleting Client %s from connection list", safeRemoteAddr(UnsafeMode, msg.Conn))
 			// remove from map of connection
-			delete(clients, msg.Conn.RemoteAddr().String())
+			delete(clients, tcpAddr.String())
 		case NewMessage:
-			addr := msg.Conn.RemoteAddr().String()
 			now := time.Now()
-			clientSendingMsg := clients[addr]
+			clientSendingMsg := clients[tcpAddr.String()]
 			if now.Sub(clientSendingMsg.LastMessageSentAt).Seconds() >= MsgRate {
 				// UPDATE the current clients latest msg sent at time
 				clientSendingMsg.LastMessageSentAt = now
@@ -85,7 +100,7 @@ func server(msgs chan Message) {
 				// loop through the rest of the clients to send the msg to them
 				for _, client := range clients {
 					// do not resend to the author of message
-					if client.Conn.RemoteAddr().String() == addr {
+					if client.Conn.RemoteAddr().String() == tcpAddr.String() {
 						continue
 					}
 
@@ -99,8 +114,9 @@ func server(msgs chan Message) {
 				}
 			} else {
 				clientSendingMsg.Strikes += 1
-				if clientSendingMsg.Strikes >= 10 {
-
+				if clientSendingMsg.Strikes >= StrikeLimit {
+					bannedList[tcpAddr.IP.String()] = now
+					clientSendingMsg.Conn.Close()
 				}
 			}
 		}
