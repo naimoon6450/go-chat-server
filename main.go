@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net"
+	"time"
 )
 
 const (
@@ -40,14 +41,24 @@ const (
 	NewMessage
 )
 
+const (
+	MsgRate = 1.0
+)
+
 type Message struct {
 	Type MessageType
 	Conn net.Conn
 	Text string
 }
 
+type Client struct {
+	Conn              net.Conn
+	LastMessageSentAt time.Time
+	Strikes           int
+}
+
 func server(msgs chan Message) {
-	conns := map[string]net.Conn{}
+	clients := map[string]*Client{} // making a map of pointers so you can determine if it exists easily via null ptr
 	// we want to traverse the slice of c
 	// and read the outgoing messages from each one
 	for {
@@ -55,24 +66,41 @@ func server(msgs chan Message) {
 		switch msg.Type {
 		case ClientConnected:
 			log.Printf("Client %s has connected", safeRemoteAddr(UnsafeMode, msg.Conn))
-			conns[msg.Conn.RemoteAddr().String()] = msg.Conn
+			clients[msg.Conn.RemoteAddr().String()] = &Client{
+				Conn:              msg.Conn,
+				LastMessageSentAt: time.Now(), // you can't connect and send a msg instantly
+			}
 		case ClientDisconnected:
 			log.Printf("Deleting Client %s form connection list", safeRemoteAddr(UnsafeMode, msg.Conn))
 			// remove from map of connection
-			delete(conns, msg.Conn.RemoteAddr().String())
+			delete(clients, msg.Conn.RemoteAddr().String())
 		case NewMessage:
-			log.Printf("Client %s send message %s", safeRemoteAddr(UnsafeMode, msg.Conn), msg.Text)
-			for _, conn := range conns {
-				// do not output the authors message
-				if conn.RemoteAddr().String() == msg.Conn.RemoteAddr().String() {
-					continue
-				}
+			addr := msg.Conn.RemoteAddr().String()
+			now := time.Now()
+			clientSendingMsg := clients[addr]
+			if now.Sub(clientSendingMsg.LastMessageSentAt).Seconds() >= MsgRate {
+				// UPDATE the current clients latest msg sent at time
+				clientSendingMsg.LastMessageSentAt = now
+				log.Printf("Client %s send message %s", safeRemoteAddr(UnsafeMode, msg.Conn), msg.Text)
+				// loop through the rest of the clients to send the msg to them
+				for _, client := range clients {
+					// do not resend to the author of message
+					if client.Conn.RemoteAddr().String() == addr {
+						continue
+					}
 
-				_, err := conn.Write([]byte(msg.Text))
-				if err != nil {
-					// REMOVE CONN FROM LIST
-					// MARK AS DEAD AND CLEAN UP ASYNC?
-					log.Println("Could not send data to %s: %s", safeRemoteAddr(UnsafeMode, msg.Conn), err)
+					// write to the output of everyone
+					_, err := client.Conn.Write([]byte(msg.Text))
+					if err != nil {
+						// REMOVE CONN FROM LIST
+						// MARK AS DEAD AND CLEAN UP ASYNC?
+						log.Println("Could not send data to %s: %s", safeRemoteAddr(UnsafeMode, msg.Conn), err)
+					}
+				}
+			} else {
+				clientSendingMsg.Strikes += 1
+				if clientSendingMsg.Strikes >= 10 {
+
 				}
 			}
 		}
@@ -99,9 +127,10 @@ func client(conn net.Conn, msgQ chan Message) {
 			return
 		}
 
+		text := string(buffer[0:n])
 		msgQ <- Message{
 			Type: NewMessage,
-			Text: string(buffer[0:n]),
+			Text: text,
 			Conn: conn,
 		}
 	}
